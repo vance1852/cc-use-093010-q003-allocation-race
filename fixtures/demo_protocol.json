@@ -1,0 +1,67 @@
+{
+  "protocol_id": "demo-cooperation-v1",
+  "version": 1,
+  "title": "跨境合作证据基础重复核验",
+  "task_family": "cross-border-cooperation",
+  "seed": 20260921,
+  "bootstrap_samples": 500,
+  "strata": [
+    {
+      "key": "verified-channel",
+      "label": "材料通道已核验",
+      "required_trials": 3
+    },
+    {
+      "key": "restricted-channel",
+      "label": "材料通道受限制",
+      "required_trials": 3
+    }
+  ],
+  "metrics": [
+    {
+      "key": "compliant",
+      "label": "是否合规",
+      "kind": "binary",
+      "unit": null,
+      "direction": "higher"
+    },
+    {
+      "key": "review_latency_hours",
+      "label": "审核耗时",
+      "kind": "continuous",
+      "unit": "h",
+      "direction": "lower"
+    },
+    {
+      "key": "exception_count",
+      "label": "例外处理次数",
+      "kind": "count",
+      "unit": "count",
+      "direction": "lower"
+    }
+  ],
+  "stratum_weights": {
+    "verified-channel": "0.4",
+    "restricted-channel": "0.6"
+  },
+  "admission_rules": [
+    {
+      "metric": "compliant",
+      "statistic": "wilson_lower",
+      "operator": "gte",
+      "threshold": "0.29"
+    },
+    {
+      "metric": "review_latency_hours",
+      "statistic": "weighted_mean",
+      "operator": "lte",
+      "threshold": "65"
+    },
+    {
+      "metric": "exception_count",
+      "statistic": "weighted_mean",
+      "operator": "lte",
+      "threshold": "1.2"
+    }
+  ]
+}
