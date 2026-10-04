@@ -149,6 +149,17 @@ CREATE TABLE IF NOT EXISTS transfers (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS transfer_decisions (
+    nomination_id TEXT PRIMARY KEY REFERENCES nominations(nomination_id),
+    transfer_id TEXT NOT NULL,
+    inventory_lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    request_sha256 TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL,
+    response_json TEXT NOT NULL,
+    decided_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    decided_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS supply_scenarios (
     scenario_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,

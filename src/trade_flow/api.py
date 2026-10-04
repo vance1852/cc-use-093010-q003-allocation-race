@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
 
+from .clock import SystemClock
 from .errors import SupplyError, ValidationFailed
 from .service import SupplyService
 from .storage import connect
@@ -22,8 +24,26 @@ class Response:
 
 
 class JsonApplication:
-    def __init__(self, service: SupplyService) -> None:
-        self.service = service
+    def __init__(self, service: SupplyService | None = None, *, database: str | Path | None = None) -> None:
+        # 多席位并发由线程化 HTTP 服务承载：若所有请求共享单个 SQLite 连接，
+        # 会触发“SQLite objects created in a thread can only be used in that
+        # same thread”。生产路径为每个请求打开独立连接，由 WAL 与立即写
+        # 事务在数据库层串行化；测试仍可直接注入单个 service。
+        if service is None and database is None:
+            raise ValueError("必须提供 service 或 database")
+        self._service = service
+        self._database = None if database is None else str(database)
+
+    @contextlib.contextmanager
+    def _service_for_request(self):
+        if self._service is not None:
+            yield self._service
+            return
+        connection = connect(self._database)
+        try:
+            yield SupplyService(connection, SystemClock())
+        finally:
+            connection.close()
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -45,6 +65,17 @@ class JsonApplication:
         return value
 
     def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+        with self._service_for_request() as service:
+            return self._handle(service, method, target, headers, body)
+
+    def _handle(
+        self,
+        service: SupplyService,
+        method: str,
+        target: str,
+        headers: Mapping[str, str] | None,
+        body: bytes,
+    ) -> Response:
         normalized = {key.lower(): value for key, value in (headers or {}).items()}
         parsed = urlparse(target)
         path = parsed.path.rstrip("/") or "/"
@@ -56,38 +87,41 @@ class JsonApplication:
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
             actor = self._actor(normalized)
             if method == "POST" and path == "/users":
-                return Response(201, self.service.create_user(payload["user_id"], payload["display_name"], payload["role"]))
+                return Response(201, service.create_user(payload["user_id"], payload["display_name"], payload["role"]))
             if method == "POST" and path == "/quotes":
-                return Response(201, self.service.record_quote(actor, payload))
+                return Response(201, service.record_quote(actor, payload))
             if method == "GET" and len(parts) == 3 and parts[:2] == ["quotes", "summary"]:
-                return Response(200, self.service.price_summary(parts[2], int(query.get("sessions", ["20"])[0])))
+                return Response(200, service.price_summary(parts[2], int(query.get("sessions", ["20"])[0])))
             if method == "POST" and path == "/facilities":
-                return Response(201, self.service.create_facility(actor, payload))
+                return Response(201, service.create_facility(actor, payload))
             if method == "POST" and path == "/routes":
-                return Response(201, self.service.create_route(actor, payload))
+                return Response(201, service.create_route(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "outages":
-                return Response(201, self.service.announce_outage(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
+                return Response(201, service.announce_outage(actor, parts[1], payload["starts_at"], payload.get("ends_at"), payload["capacity_percent"], payload["reason"]))
             if method == "POST" and path == "/inventory/lots":
-                return Response(201, self.service.add_inventory_lot(actor, payload))
+                return Response(201, service.add_inventory_lot(actor, payload))
             if method == "GET" and path == "/inventory/summary":
-                return Response(200, self.service.inventory_summary(query.get("facility_id", [""])[0], query.get("product", [""])[0]))
+                return Response(200, service.inventory_summary(query.get("facility_id", [""])[0], query.get("product", [""])[0]))
             if method == "POST" and path == "/nominations":
-                return Response(201, self.service.submit_nomination(actor, payload))
+                return Response(201, service.submit_nomination(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocate":
-                return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
+                return Response(200, service.allocate(actor, parts[1], payload["service_date"]))
             if method == "POST" and path == "/transfers":
-                return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
+                return Response(201, service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
             if method == "POST" and path == "/scenarios":
-                return Response(201, self.service.create_scenario(actor, payload))
+                return Response(201, service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
-                return Response(200, self.service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
+                return Response(200, service.approve_scenario(actor, parts[1], int(payload["expected_revision"])))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "run":
-                return Response(200, self.service.run_scenario(actor, parts[1], payload["as_of_date"]))
+                return Response(200, service.run_scenario(actor, parts[1], payload["as_of_date"]))
             if method == "GET" and path == "/audit/chain":
-                return Response(200, self.service.audit_chain(actor))
+                return Response(200, service.audit_chain(actor))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
-            return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+            error: dict[str, Any] = {"code": exc.code, "message": str(exc)}
+            if getattr(exc, "details", None):
+                error["details"] = exc.details
+            return Response(exc.status, {"error": error})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
@@ -125,15 +159,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args(argv)
-    connection = connect(args.database)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(SupplyService(connection))))
+    # 先建立一次连接以初始化模式；每个请求随后使用自己的连接访问同一数据库。
+    with contextlib.closing(connect(args.database)):
+        pass
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(JsonApplication(database=args.database)))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
-        connection.close()
     return 0
 
 
